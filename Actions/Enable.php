@@ -127,11 +127,33 @@ class Enable extends Action
         $this->site->save();
 
         try {
-            // Restart services
-            $this->site->server->ssh()->exec('sudo systemctl restart varnish');
-            $this->site->server->ssh()->exec('sudo systemctl reload nginx');
+            // Restart services with more robust error handling
+            $ssh = $this->site->server->ssh();
+            
+            // First, try to start Varnish (in case it's not running)
+            try {
+                $ssh->exec('sudo systemctl start varnish 2>&1');
+            } catch (\Exception $e) {
+                // If start fails, try restart
+                $ssh->exec('sudo systemctl restart varnish 2>&1');
+            }
+            
+            // Verify Varnish is running
+            $varnishStatus = $ssh->exec('sudo systemctl is-active varnish 2>&1 || echo "inactive"');
+            if (trim($varnishStatus) !== 'active') {
+                throw new \Exception('Varnish service failed to start. Status: ' . $varnishStatus);
+            }
+            
+            // Reload Nginx
+            $ssh->exec('sudo systemctl reload nginx 2>&1');
+            
+            // Verify Nginx is running
+            $nginxStatus = $ssh->exec('sudo systemctl is-active nginx 2>&1 || echo "inactive"');
+            if (trim($nginxStatus) !== 'active') {
+                throw new \Exception('Nginx service failed to reload. Status: ' . $nginxStatus);
+            }
         } catch (\Exception $e) {
-            throw new \Exception('Varnish configured but failed to restart services: ' . $e->getMessage() . '. Please restart manually.');
+            throw new \Exception('Varnish configured but failed to restart services: ' . $e->getMessage() . '. Please restart manually with: sudo systemctl restart varnish && sudo systemctl reload nginx');
         }
 
         $request->session()->flash('success', 'Varnish cache has been enabled for this site.');
