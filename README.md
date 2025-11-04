@@ -9,6 +9,11 @@ A powerful Varnish HTTP accelerator plugin for VitoDeploy that enables blazing-f
 
 - **🔥 High-Performance Caching**: Leverage Varnish as a reverse proxy to dramatically improve website load times
 - **🎯 Per-Site Configuration**: Enable/disable Varnish cache on a per-website basis
+- **🌐 Multi-Site & Multi-Domain Support**: 
+  - Works with unlimited websites on the same server
+  - Each site has independent Varnish configuration
+  - Domain aliases supported for each site
+  - All sites share one Varnish instance (efficient resource usage)
 - **⚙️ Flexible Configuration**: Customize cache TTL, memory allocation, and backend ports
 - **🧹 Cache Management**: Purge entire cache, specific URL patterns, or individual pages
 - **🔒 Smart Caching Rules**: 
@@ -60,20 +65,21 @@ A powerful Varnish HTTP accelerator plugin for VitoDeploy that enables blazing-f
 
 ### Enabling Varnish for a Site
 
-1. Navigate to your site in VitoDeploy
+1. Navigate to your site in VitoDeploy (e.g., `/servers/1/sites/1`)
 2. Go to the **Features** tab
 3. Find **Varnish Cache** in the available features
 4. Click **Enable**
 5. Configure the settings:
-   - **Backend Port**: Port where your web server will listen (default: 8080)
    - **Cache TTL**: Default cache time-to-live in seconds (default: 300)
    - **Cache Memory**: Memory allocation for Varnish (e.g., 256M, 1G)
 6. Click **Save**
 
-**Important**: After enabling Varnish:
-- Your web server will listen on the backend port (e.g., 8080)
-- Varnish will listen on ports 80 and 443
-- All traffic will flow through Varnish
+**How it works**:
+- Varnish runs on port **6081** (doesn't conflict with your existing services)
+- Nginx remains on ports **80** and **443**
+- Nginx proxies requests through Varnish for caching
+- All traffic flows: **Client → Nginx (80/443) → Varnish (6081) → Nginx → PHP/App**
+- No port conflicts with Redis (6379) or other services
 
 ### Disabling Varnish for a Site
 
@@ -83,6 +89,32 @@ A powerful Varnish HTTP accelerator plugin for VitoDeploy that enables blazing-f
 4. Confirm the action
 
 Your web server will automatically be restored to listen on ports 80 and 443.
+
+### Using Varnish with Multiple Sites
+
+**Yes! The plugin supports multiple websites on the same server.**
+
+#### How It Works:
+
+1. **One Varnish instance** runs on port 6081 for the entire server
+2. **Each site** can enable/disable Varnish independently
+3. **Each site** has its own VCL configuration file in `/etc/varnish/sites/`
+4. **Varnish routes** requests based on the `Host` header
+
+#### Example Setup:
+
+- **Site 1** (example.com): Varnish enabled, 5-minute cache
+- **Site 2** (myapp.com): Varnish enabled, 10-minute cache  
+- **Site 3** (test.com): Varnish disabled (direct Nginx)
+
+All work together on the same server without conflicts!
+
+#### Benefits:
+
+- ✅ Shared Varnish memory pool (efficient)
+- ✅ Independent cache rules per domain
+- ✅ Easy to enable/disable per site
+- ✅ No port conflicts between sites
 
 ### Purging Cache
 
@@ -114,6 +146,26 @@ Clears cache for a specific URL.
 4. Click **Purge**
 
 ## ⚙️ Configuration
+
+### Port Configuration
+
+- **Varnish**: Runs on port 6081 (internal only)
+- **Nginx**: Remains on ports 80/443 (public access)
+- **No conflicts**: Works alongside Redis (6379), MySQL, and other services
+
+### How Varnish Works in This Setup
+
+```
+Internet → Nginx (80/443) → Varnish (6081) → Back to Nginx → PHP/Application
+```
+
+1. Request arrives at Nginx on port 80/443
+2. Nginx proxies to Varnish on port 6081
+3. Varnish checks cache:
+   - **Cache HIT**: Returns cached content immediately
+   - **Cache MISS**: Varnish requests from Nginx (without proxy)
+4. Nginx processes PHP/static files
+5. Response cached by Varnish and sent to client
 
 ### Default Varnish Behavior
 
@@ -191,6 +243,23 @@ sub vcl_backend_response {
 ```
 
 ## 🐛 Troubleshooting
+
+### APT Repository Errors During Installation
+
+If you see errors like `GPG error` or `The repository is not signed` when enabling Varnish:
+
+```bash
+# Fix expired MySQL GPG key
+sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys B7B3B788A8D3785C
+
+# Or remove problematic repo temporarily
+sudo mv /etc/apt/sources.list.d/mysql.list /etc/apt/sources.list.d/mysql.list.disabled
+
+# Update and retry
+sudo apt-get update --allow-releaseinfo-change -y
+```
+
+The plugin will automatically try to install Varnish from official repos if the default installation fails.
 
 ### Varnish Not Starting
 
@@ -273,7 +342,14 @@ Then go to **Admin → Plugins** in VitoDeploy and click **Reload**.
 
 ## 📝 Changelog
 
-### Version 2.0.0 (2025-01-05)
+### Version 2.0.1 (2025-11-05)
+- **Fixed**: Site type registration - now works with php, laravel, wordpress, php-blank sites
+- **Fixed**: Port architecture - Varnish uses port 6081, Nginx stays on 80/443
+- **Fixed**: No port conflicts with Redis (6379) or other services
+- **Improved**: Cleaner Nginx configuration using include files
+- **Improved**: Better error handling and backup/restore functionality
+
+### Version 2.0.0 (2025-11-05)
 - Complete rewrite for VitoDeploy 3.x compatibility
 - Added per-site Varnish configuration
 - Enhanced cache purging options (all/pattern/single URL)

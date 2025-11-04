@@ -138,9 +138,48 @@ class Enable extends Action
         }
 
         // Install Varnish
-        $ssh->exec('sudo apt-get update -y', 'update-packages');
-        $ssh->exec('sudo apt-get install -y varnish', 'install-varnish');
+        // Use --allow-releaseinfo-change to handle repository updates
+        // Use || true to continue even if update has warnings
+        $ssh->exec('sudo apt-get update --allow-releaseinfo-change -y 2>&1 || true', 'update-packages');
+        
+        // Install Varnish - if it fails, try to install from official Varnish repos
+        try {
+            $ssh->exec('sudo apt-get install -y varnish 2>&1', 'install-varnish');
+        } catch (\Exception $e) {
+            // If default repos fail, install from Varnish official repos
+            $this->installVarnishFromOfficialRepo($ssh);
+        }
+        
         $ssh->exec('sudo systemctl enable varnish', 'enable-varnish');
+    }
+    
+    /**
+     * Install Varnish from official repository as fallback
+     *
+     * @param $ssh
+     * @return void
+     * @throws SSHError
+     */
+    private function installVarnishFromOfficialRepo($ssh): void
+    {
+        // Install prerequisites
+        $ssh->exec('sudo apt-get install -y curl gnupg apt-transport-https 2>&1 || true');
+        
+        // Add Varnish official repository
+        $commands = [
+            'curl -fsSL https://packagecloud.io/varnishcache/varnish70/gpgkey | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/varnish.gpg',
+            'echo "deb https://packagecloud.io/varnishcache/varnish70/ubuntu/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/varnish.list',
+            'sudo apt-get update -y 2>&1 || true',
+            'sudo apt-get install -y varnish 2>&1'
+        ];
+        
+        foreach ($commands as $command) {
+            try {
+                $ssh->exec($command);
+            } catch (\Exception $e) {
+                // Continue with next command
+            }
+        }
     }
 
     /**
@@ -315,6 +354,7 @@ VCL;
 
     /**
      * Update Nginx configuration to proxy through Varnish
+     * This creates a separate config file that Nginx includes
      *
      * @return void
      * @throws SSHError
@@ -323,98 +363,85 @@ VCL;
     {
         $ssh = $this->site->server->ssh();
         $domain = $this->site->domain;
-        $configPath = "/etc/nginx/sites-available/$domain";
+        $varnishConfigPath = "/etc/nginx/varnish.d/{$domain}.conf";
         
-        // Create a location block that will be prepended to the existing config
-        // This will catch all requests and proxy them to Varnish on port 6081
-        $varnishLocation = <<<'NGINX'
+        // Create varnish.d directory if it doesn't exist
+        $ssh->exec("sudo mkdir -p /etc/nginx/varnish.d");
+        
+        // Create Varnish proxy configuration
+        // This proxies all requests to Varnish on port 6081
+        $varnishConfig = <<<'NGINX'
+# Varnish Cache Proxy Configuration
+# All requests are proxied to Varnish on port 6081
 
-    # Varnish Cache Proxy
-    location / {
-        proxy_pass http://127.0.0.1:6081;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-Port $server_port;
-        
-        # Cache status headers
-        add_header X-Cache-Status $upstream_cache_status;
-        
-        # Try files is handled by the original location block after Varnish
-        try_files $uri $uri/ @varnish;
-    }
-    
-    location @varnish {
-        proxy_pass http://127.0.0.1:6081;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
+proxy_pass http://127.0.0.1:6081;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-Port $server_port;
+proxy_redirect off;
 
+# Buffer settings
+proxy_buffering on;
+proxy_buffer_size 4k;
+proxy_buffers 24 4k;
+proxy_busy_buffers_size 8k;
+proxy_max_temp_file_size 2048m;
+proxy_temp_file_write_size 32k;
 NGINX;
 
-        // Add marker to the nginx config so we can find and remove it later
-        $markerStart = "# VARNISH_CACHE_START";
-        $markerEnd = "# VARNISH_CACHE_END";
-        
-        // Check if Varnish config already exists
-        $checkMarker = $ssh->exec("sudo grep -q '$markerStart' $configPath && echo 'exists' || echo 'not-exists'");
-        
-        if (trim($checkMarker) === 'not-exists') {
-            // Backup original config
-            $ssh->exec("sudo cp $configPath {$configPath}.backup");
-            
-            // Insert Varnish proxy config before the first location block
-            $insertCommand = <<<BASH
-sudo sed -i '/location \//i\\
-$markerStart\\
-$varnishLocation\\
-$markerEnd' $configPath
-BASH;
-            
-            try {
-                $ssh->exec($insertCommand);
-            } catch (\Exception $e) {
-                // Alternative method: read, modify, write
-                $this->insertVarnishConfigAlternative($ssh, $domain, $markerStart, $varnishLocation, $markerEnd);
-            }
-        }
+        // Write Varnish proxy config
+        $tempFile = tempnam(sys_get_temp_dir(), 'varnish-nginx');
+        file_put_contents($tempFile, $varnishConfig);
+        $ssh->upload($tempFile, "/tmp/varnish-{$domain}.conf");
+        $ssh->exec("sudo mv /tmp/varnish-{$domain}.conf $varnishConfigPath");
+        $ssh->exec("sudo chmod 644 $varnishConfigPath");
+        unlink($tempFile);
+
+        // Now update the main Nginx config to include this file in location /
+        $this->includeVarnishInNginx($ssh, $domain, $varnishConfigPath);
     }
     
     /**
-     * Alternative method to insert Varnish config into Nginx
+     * Include Varnish configuration in the main Nginx site config
      *
      * @param $ssh
      * @param string $domain
-     * @param string $markerStart
-     * @param string $varnishLocation
-     * @param string $markerEnd
+     * @param string $varnishConfigPath
      * @return void
      * @throws SSHError
      */
-    private function insertVarnishConfigAlternative($ssh, string $domain, string $markerStart, string $varnishLocation, string $markerEnd): void
+    private function includeVarnishInNginx($ssh, string $domain, string $varnishConfigPath): void
     {
         $configPath = "/etc/nginx/sites-available/$domain";
+        
+        // Backup original config
+        $ssh->exec("sudo cp $configPath {$configPath}.varnish-backup");
         
         // Download config
         $tempLocal = tempnam(sys_get_temp_dir(), 'nginx');
         $ssh->download($configPath, $tempLocal);
         
-        // Read and modify
+        // Read config
         $content = file_get_contents($tempLocal);
         
-        // Find first location block and insert before it
-        $pattern = '/(location\s+\/\s+{)/';
-        $replacement = "$markerStart\n$varnishLocation\n$markerEnd\n$1";
-        $content = preg_replace($pattern, $replacement, $content, 1);
+        // Add include directive in the location / block
+        // Find the location / block and add include after the opening brace
+        $pattern = '/(location\s+\/\s+\{)/';
+        $includeDirective = "include $varnishConfigPath;";
+        $replacement = "$1\n        # VARNISH_INCLUDE_START\n        $includeDirective\n        # VARNISH_INCLUDE_END\n";
         
-        // Write back
-        file_put_contents($tempLocal, $content);
-        $ssh->upload($tempLocal, "/tmp/nginx-$domain.conf");
-        $ssh->exec("sudo mv /tmp/nginx-$domain.conf $configPath");
-        $ssh->exec("sudo chmod 644 $configPath");
+        // Check if already included
+        if (strpos($content, '# VARNISH_INCLUDE_START') === false) {
+            $content = preg_replace($pattern, $replacement, $content, 1);
+            
+            // Write back
+            file_put_contents($tempLocal, $content);
+            $ssh->upload($tempLocal, "/tmp/nginx-$domain.conf");
+            $ssh->exec("sudo mv /tmp/nginx-$domain.conf $configPath");
+            $ssh->exec("sudo chmod 644 $configPath");
+        }
         
         unlink($tempLocal);
     }

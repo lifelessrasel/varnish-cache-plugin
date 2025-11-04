@@ -1,62 +1,71 @@
-# Varnish Cache Plugin v2.0.0
+# Varnish Cache Plugin v2.0.1
 
-## 🎉 Major Release - VitoDeploy 3.x Support
+## 🐛 Bug Fixes & Improvements
 
-This is a complete rewrite of the Varnish Cache Plugin with full support for VitoDeploy 3.x and many new features!
+This release fixes critical issues from v2.0.0 and improves the architecture.
 
-## ✨ What's New
+## ✨ What's Fixed
 
-### Core Features
-- **✅ VitoDeploy 3.x Compatibility** - Completely rewritten to work with the latest VitoDeploy
-- **🎯 Per-Site Configuration** - Enable Varnish on a per-website basis with individual settings
-- **🧹 Enhanced Cache Purging** - Three purge modes: all content, URL patterns, or single URLs
-- **⚡ Smart VCL Defaults** - Intelligent caching rules that work out of the box
-- **🔧 Automatic Setup** - Installs and configures Varnish automatically
-- **🌐 Multi-Domain Support** - Works with domain aliases seamlessly
+### Critical Fixes
+- **✅ Site Type Registration Fixed** - Plugin now properly registers for php, laravel, wordpress, and php-blank site types
+- **✅ Port Conflict Resolution** - Varnish now uses port 6081 internally, Nginx remains on 80/443
+- **✅ No Service Disruption** - Works alongside Redis (6379), MySQL, and other services without conflicts
 
-### Improvements
-- **WordPress Optimization** - Automatic handling of WordPress cookies and logged-in users
-- **Cache Monitoring** - Added `X-Cache` headers to monitor cache hits/misses
-- **Better Error Handling** - More robust error handling and recovery
-- **Comprehensive Documentation** - Detailed README with troubleshooting guide
-- **Flexible Configuration** - Customize cache TTL, memory allocation, and backend ports
+### Architecture Improvements
+- **🔧 Better Nginx Integration** - Uses include files instead of direct config modification
+- **♻️ Cleaner Rollback** - Backup and restore functionality improved
+- **📁 Separate Config Files** - Varnish config stored in `/etc/nginx/varnish.d/`
+- **🛡️ Less Invasive** - Original Nginx config preserved with backup
+
+## 🏗️ New Architecture
+
+```
+Client Request → Nginx (80/443) → Varnish (6081) → Nginx → PHP/App
+```
+
+**Benefits**:
+- Nginx stays on standard ports (80/443)
+- Varnish on internal port (6081)
+- No conflicts with existing services
+- Easy to enable/disable per site
 
 ## 📋 Installation
 
-### Via VitoDeploy UI (Recommended)
+Same as before - via VitoDeploy UI:
 
-1. Navigate to **Admin → Plugins** in VitoDeploy
+1. Navigate to **Admin → Plugins**
 2. Click **Install Plugin**
 3. Enter: `https://github.com/lifelessrasel/varnish-cache-plugin`
-4. Click **Install** and then **Enable**
+4. Install and Enable
 
-### Manual Installation
+## 🎯 Usage
 
-```bash
-cd /path/to/vitodeploy/app/Vito/Plugins
-git clone https://github.com/lifelessrasel/varnish-cache-plugin.git Lifelessrasel/VarnishCachePlugin
-```
+Navigate to your site → **Features** tab → Enable **Varnish Cache**
 
-Then discover and enable the plugin in VitoDeploy UI.
+The plugin settings appear at: `/servers/{server-id}/sites/{site-id}/features`
 
-## 🚀 Quick Start
+## ⚙️ Configuration
 
-1. Install and enable the plugin
-2. Go to any site → **Features** tab
-3. Find **Varnish Cache** and click **Enable**
-4. Configure settings (or use defaults)
-5. Save and enjoy blazing fast performance!
+### Port Usage
+- **Varnish**: Port 6081 (internal)
+- **Nginx**: Ports 80/443 (public)
+- **No conflicts** with Redis, MySQL, etc.
 
-## 📊 Default Configuration
-
-- **Backend Port**: 8080 (web server listens here)
+### Default Settings
 - **Cache TTL**: 300 seconds (5 minutes)
 - **Cache Memory**: 256M
-- **Varnish Ports**: 80 and 443 (public access)
 
-## 🎯 Cache Behavior
+## 🔄 Upgrading from v2.0.0
 
-### Cached Automatically
+If you installed v2.0.0:
+
+1. Disable Varnish on all sites
+2. Update the plugin
+3. Re-enable Varnish with new settings
+
+The new version is backward compatible but uses a different architecture.
+
+## 📊 Default Configuration
 ✅ GET and HEAD requests  
 ✅ Static files (images, CSS, JS, fonts)  
 ✅ Unauthenticated requests  

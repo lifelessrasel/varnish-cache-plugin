@@ -104,20 +104,22 @@ class Disable extends Action
         $ssh = $this->site->server->ssh();
         $domain = $this->site->domain;
         $configPath = "/etc/nginx/sites-available/$domain";
+        $varnishConfigPath = "/etc/nginx/varnish.d/{$domain}.conf";
         
-        // Remove Varnish markers and config
-        $markerStart = "# VARNISH_CACHE_START";
-        $markerEnd = "# VARNISH_CACHE_END";
+        // Remove the Varnish config file
+        $ssh->exec("sudo rm -f $varnishConfigPath");
         
-        // Check if backup exists
-        $backupExists = $ssh->exec("test -f {$configPath}.backup && echo 'yes' || echo 'no'");
+        // Restore from backup if it exists
+        $backupPath = "{$configPath}.varnish-backup";
+        $backupExists = $ssh->exec("test -f $backupPath && echo 'yes' || echo 'no'");
         
         if (trim($backupExists) === 'yes') {
             // Restore from backup
-            $ssh->exec("sudo mv {$configPath}.backup $configPath");
+            $ssh->exec("sudo cp $backupPath $configPath");
+            $ssh->exec("sudo rm -f $backupPath");
         } else {
-            // Remove lines between markers
-            $ssh->exec("sudo sed -i '/$markerStart/,/$markerEnd/d' $configPath");
+            // Remove include lines from config
+            $ssh->exec("sudo sed -i '/# VARNISH_INCLUDE_START/,/# VARNISH_INCLUDE_END/d' $configPath");
         }
     }
 
