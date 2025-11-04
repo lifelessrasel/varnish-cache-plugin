@@ -61,23 +61,22 @@ class Disable extends Action
      */
     public function handle(Request $request): void
     {
-        // Get stored configuration
-        $typeData = $this->site->type_data ?? [];
-        $backendPort = data_get($typeData, 'varnish_backend_port', 8080);
-
-        // Restore web server configuration
-        $this->restoreWebServerConfig($backendPort);
+        // Remove Nginx Varnish proxy configuration
+        $this->removeNginxVarnishConfig();
 
         // Remove VCL configuration
         $this->removeVarnishConfig();
 
         // Update site metadata
+        $typeData = $this->site->type_data ?? [];
         data_set($typeData, 'varnish_enabled', false);
-        data_forget($typeData, 'varnish_backend_port');
         data_forget($typeData, 'varnish_cache_ttl');
         data_forget($typeData, 'varnish_memory');
         $this->site->type_data = $typeData;
         $this->site->save();
+
+        // Reload Nginx
+        $this->site->server->ssh()->exec('sudo systemctl reload nginx');
 
         // Check if any other sites are using Varnish
         $otherSitesUsingVarnish = $this->checkOtherSitesUsingVarnish();
@@ -95,46 +94,31 @@ class Disable extends Action
     }
 
     /**
-     * Restore web server configuration to listen on standard ports
+     * Remove Nginx Varnish proxy configuration
      *
-     * @param int $backendPort
-     * @return void
-     */
-    private function restoreWebServerConfig(int $backendPort): void
-    {
-        $webserver = $this->site->webserver();
-
-        if ($webserver->id() === 'nginx') {
-            $this->restoreNginxConfig($backendPort);
-            return;
-        }
-
-        throw new RuntimeException('Unsupported webserver: ' . $webserver->id());
-    }
-
-    /**
-     * Restore Nginx configuration to standard ports
-     *
-     * @param int $backendPort
      * @return void
      * @throws SSHError
      */
-    private function restoreNginxConfig(int $backendPort): void
+    private function removeNginxVarnishConfig(): void
     {
         $ssh = $this->site->server->ssh();
         $domain = $this->site->domain;
-
-        // Restore listen directives to standard ports
-        $ssh->exec("sudo sed -i 's/listen $backendPort;/listen 80;/' /etc/nginx/sites-available/$domain");
-        $ssh->exec("sudo sed -i 's/listen \\[\\:\\:\\]:$backendPort;/listen [::]:80;/' /etc/nginx/sites-available/$domain");
+        $configPath = "/etc/nginx/sites-available/$domain";
         
-        // Restore SSL ports if they exist
-        $sslBackendPort = $backendPort + 363;
-        $ssh->exec("sudo sed -i 's/listen $sslBackendPort ssl;/listen 443 ssl;/' /etc/nginx/sites-available/$domain");
-        $ssh->exec("sudo sed -i 's/listen \\[\\:\\:\\]:$sslBackendPort ssl;/listen [::]:443 ssl;/' /etc/nginx/sites-available/$domain");
+        // Remove Varnish markers and config
+        $markerStart = "# VARNISH_CACHE_START";
+        $markerEnd = "# VARNISH_CACHE_END";
         
-        // Reload Nginx
-        $ssh->exec('sudo systemctl reload nginx');
+        // Check if backup exists
+        $backupExists = $ssh->exec("test -f {$configPath}.backup && echo 'yes' || echo 'no'");
+        
+        if (trim($backupExists) === 'yes') {
+            // Restore from backup
+            $ssh->exec("sudo mv {$configPath}.backup $configPath");
+        } else {
+            // Remove lines between markers
+            $ssh->exec("sudo sed -i '/$markerStart/,/$markerEnd/d' $configPath");
+        }
     }
 
     /**

@@ -43,7 +43,7 @@ class Plugin extends AbstractPlugin
      * Bootstrap the plugin and register features
      *
      * This method is called when the plugin is loaded. It registers:
-     * - The Varnish cache feature for all site types
+     * - The Varnish cache feature for supported site types
      * - Enable action to activate Varnish for a site
      * - Disable action to deactivate Varnish for a site
      * - Purge cache action to clear cached content
@@ -52,32 +52,34 @@ class Plugin extends AbstractPlugin
      */
     public function boot(): void
     {
-        // Register the Varnish cache feature for all site types
-        // This makes the feature available in the site's features panel
-        RegisterSiteFeature::make('*', 'varnish-cache')
-            ->label('Varnish Cache')
-            ->description('Enable Varnish HTTP accelerator for blazing fast performance')
-            ->register();
+        // List of supported site types
+        $siteTypes = ['php', 'laravel', 'wordpress', 'php-blank'];
 
-        // Register the enable action
-        // This action installs and configures Varnish for the selected site
-        RegisterSiteFeatureAction::make('*', 'varnish-cache', 'enable')
-            ->label('Enable')
-            ->handler(Enable::class)
-            ->register();
+        // Register the Varnish cache feature for each supported site type
+        foreach ($siteTypes as $siteType) {
+            // Register the feature
+            RegisterSiteFeature::make($siteType, 'varnish-cache')
+                ->label('Varnish Cache')
+                ->description('Enable Varnish HTTP accelerator for blazing fast performance')
+                ->register();
 
-        // Register the disable action
-        // This action disables Varnish and restores direct web server access
-        RegisterSiteFeatureAction::make('*', 'varnish-cache', 'disable')
-            ->label('Disable')
-            ->handler(Disable::class)
-            ->register();
+            // Register the enable action
+            RegisterSiteFeatureAction::make($siteType, 'varnish-cache', 'enable')
+                ->label('Enable')
+                ->handler(Enable::class)
+                ->register();
 
-        // Register the purge cache action
-        // This action clears all cached content for the site
-        RegisterSiteFeatureAction::make('*', 'varnish-cache', 'purge')
-            ->label('Purge Cache')
-            ->handler(PurgeCache::class)
-            ->register();
+            // Register the disable action
+            RegisterSiteFeatureAction::make($siteType, 'varnish-cache', 'disable')
+                ->label('Disable')
+                ->handler(Disable::class)
+                ->register();
+
+            // Register the purge cache action
+            RegisterSiteFeatureAction::make($siteType, 'varnish-cache', 'purge')
+                ->label('Purge Cache')
+                ->handler(PurgeCache::class)
+                ->register();
+        }
     }
 }

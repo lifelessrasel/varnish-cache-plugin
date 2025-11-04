@@ -13,18 +13,16 @@ use RuntimeException;
 /**
  * Enable Varnish Cache Action
  * 
- * This action installs Varnish (if not already installed), configures it as a
- * reverse proxy for the site, and updates the web server configuration to
- * work behind Varnish.
+ * This action installs Varnish (if not already installed) and configures Nginx
+ * to proxy requests through Varnish. Nginx remains on ports 80/443, and Varnish
+ * runs on port 6081.
  * 
  * Flow:
  * 1. Check if Varnish is already enabled
- * 2. Install Varnish if not present
- * 3. Configure Varnish backend to point to the site's port
- * 4. Create VCL configuration for the site
- * 5. Update web server to listen on backend port
- * 6. Configure Varnish to listen on the public port
- * 7. Restart services
+ * 2. Install Varnish if not present on port 6081
+ * 3. Create VCL configuration for the site
+ * 4. Update Nginx to proxy_pass through Varnish
+ * 5. Restart services
  */
 class Enable extends Action
 {
@@ -60,12 +58,7 @@ class Enable extends Action
             DynamicField::make('info')
                 ->alert()
                 ->options(['type' => 'info'])
-                ->description('Varnish will be installed as a reverse proxy cache. Your site will be moved to port 8080, and Varnish will listen on ports 80/443.'),
-            DynamicField::make('backend_port')
-                ->text()
-                ->label('Backend Port')
-                ->default(8080)
-                ->description('Port where your web server will listen (Varnish will proxy to this port)'),
+                ->description('Varnish will be installed on port 6081. Nginx will proxy requests through Varnish for caching.'),
             DynamicField::make('cache_ttl')
                 ->text()
                 ->label('Cache TTL (seconds)')
@@ -90,38 +83,36 @@ class Enable extends Action
     {
         // Validate input
         Validator::make($request->all(), [
-            'backend_port' => 'required|integer|min:1024|max:65535',
             'cache_ttl' => 'required|integer|min:0',
             'memory' => 'required|string',
         ])->validate();
 
-        $backendPort = $request->input('backend_port', 8080);
         $cacheTtl = $request->input('cache_ttl', 300);
         $memory = $request->input('memory', '256M');
 
         // Check if Varnish is installed, install if not
         $this->installVarnish();
 
-        // Create Varnish VCL configuration
-        $this->createVarnishConfig($backendPort, $cacheTtl);
-
-        // Update web server configuration
-        $this->updateWebServerConfig($backendPort);
-
-        // Configure Varnish service
+        // Configure Varnish service to run on port 6081
         $this->configureVarnishService($memory);
+
+        // Create Varnish VCL configuration
+        $this->createVarnishConfig($cacheTtl);
+
+        // Update Nginx to proxy through Varnish
+        $this->updateNginxForVarnish();
 
         // Update site metadata
         $typeData = $this->site->type_data ?? [];
         data_set($typeData, 'varnish_enabled', true);
-        data_set($typeData, 'varnish_backend_port', $backendPort);
         data_set($typeData, 'varnish_cache_ttl', $cacheTtl);
         data_set($typeData, 'varnish_memory', $memory);
         $this->site->type_data = $typeData;
         $this->site->save();
 
-        // Restart Varnish
+        // Restart services
         $this->site->server->ssh()->exec('sudo systemctl restart varnish');
+        $this->site->server->ssh()->exec('sudo systemctl reload nginx');
 
         $request->session()->flash('success', 'Varnish cache has been enabled for this site.');
     }
@@ -155,12 +146,11 @@ class Enable extends Action
     /**
      * Create Varnish VCL configuration for the site
      *
-     * @param int $backendPort
      * @param int $cacheTtl
      * @return void
      * @throws SSHError
      */
-    private function createVarnishConfig(int $backendPort, int $cacheTtl): void
+    private function createVarnishConfig(int $cacheTtl): void
     {
         $domain = $this->site->domain;
         $aliases = $this->site->aliases ?? [];
@@ -175,15 +165,16 @@ class Enable extends Action
             return "req.http.host == \"$host\"";
         }, $allowedHosts));
 
+        // Varnish will listen on 6081 and proxy to Nginx on 80
         $vcl = <<<VCL
 vcl 4.1;
 
 import std;
 
-# Backend configuration
+# Backend configuration - points to localhost:80 where Nginx is running
 backend default {
     .host = "127.0.0.1";
-    .port = "$backendPort";
+    .port = "80";
     .connect_timeout = 600s;
     .first_byte_timeout = 600s;
     .between_bytes_timeout = 600s;
@@ -301,9 +292,9 @@ VCL;
         // Update main Varnish config to include this site
         $this->updateMainVarnishConfig($vclPath);
     }
-
+    
     /**
-     * Update main Varnish configuration
+     * Update main Varnish configuration to include site VCL
      *
      * @param string $vclPath
      * @return void
@@ -323,50 +314,113 @@ VCL;
     }
 
     /**
-     * Update web server configuration to listen on backend port
+     * Update Nginx configuration to proxy through Varnish
      *
-     * @param int $backendPort
-     * @return void
-     */
-    private function updateWebServerConfig(int $backendPort): void
-    {
-        $webserver = $this->site->webserver();
-
-        if ($webserver->id() === 'nginx') {
-            // Update Nginx to listen on backend port
-            $this->updateNginxConfig($backendPort);
-            return;
-        }
-
-        throw new RuntimeException('Unsupported webserver: ' . $webserver->id());
-    }
-
-    /**
-     * Update Nginx configuration
-     *
-     * @param int $backendPort
      * @return void
      * @throws SSHError
      */
-    private function updateNginxConfig(int $backendPort): void
+    private function updateNginxForVarnish(): void
     {
         $ssh = $this->site->server->ssh();
         $domain = $this->site->domain;
+        $configPath = "/etc/nginx/sites-available/$domain";
         
-        // Update listen directives
-        $ssh->exec("sudo sed -i 's/listen 80;/listen $backendPort;/' /etc/nginx/sites-available/$domain");
-        $ssh->exec("sudo sed -i 's/listen \\[\\:\\:\\]:80;/listen [::]:$backendPort;/' /etc/nginx/sites-available/$domain");
+        // Create a location block that will be prepended to the existing config
+        // This will catch all requests and proxy them to Varnish on port 6081
+        $varnishLocation = <<<'NGINX'
+
+    # Varnish Cache Proxy
+    location / {
+        proxy_pass http://127.0.0.1:6081;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Port $server_port;
         
-        // If SSL is enabled, update those too
-        $ssh->exec("sudo sed -i 's/listen 443 ssl;/listen " . ($backendPort + 363) . " ssl;/' /etc/nginx/sites-available/$domain");
-        $ssh->exec("sudo sed -i 's/listen \\[\\:\\:\\]:443 ssl;/listen [::]:". ($backendPort + 363) . " ssl;/' /etc/nginx/sites-available/$domain");
+        # Cache status headers
+        add_header X-Cache-Status $upstream_cache_status;
         
-        // Reload Nginx
-        $ssh->exec('sudo systemctl reload nginx');
+        # Try files is handled by the original location block after Varnish
+        try_files $uri $uri/ @varnish;
+    }
+    
+    location @varnish {
+        proxy_pass http://127.0.0.1:6081;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+NGINX;
+
+        // Add marker to the nginx config so we can find and remove it later
+        $markerStart = "# VARNISH_CACHE_START";
+        $markerEnd = "# VARNISH_CACHE_END";
+        
+        // Check if Varnish config already exists
+        $checkMarker = $ssh->exec("sudo grep -q '$markerStart' $configPath && echo 'exists' || echo 'not-exists'");
+        
+        if (trim($checkMarker) === 'not-exists') {
+            // Backup original config
+            $ssh->exec("sudo cp $configPath {$configPath}.backup");
+            
+            // Insert Varnish proxy config before the first location block
+            $insertCommand = <<<BASH
+sudo sed -i '/location \//i\\
+$markerStart\\
+$varnishLocation\\
+$markerEnd' $configPath
+BASH;
+            
+            try {
+                $ssh->exec($insertCommand);
+            } catch (\Exception $e) {
+                // Alternative method: read, modify, write
+                $this->insertVarnishConfigAlternative($ssh, $domain, $markerStart, $varnishLocation, $markerEnd);
+            }
+        }
+    }
+    
+    /**
+     * Alternative method to insert Varnish config into Nginx
+     *
+     * @param $ssh
+     * @param string $domain
+     * @param string $markerStart
+     * @param string $varnishLocation
+     * @param string $markerEnd
+     * @return void
+     * @throws SSHError
+     */
+    private function insertVarnishConfigAlternative($ssh, string $domain, string $markerStart, string $varnishLocation, string $markerEnd): void
+    {
+        $configPath = "/etc/nginx/sites-available/$domain";
+        
+        // Download config
+        $tempLocal = tempnam(sys_get_temp_dir(), 'nginx');
+        $ssh->download($configPath, $tempLocal);
+        
+        // Read and modify
+        $content = file_get_contents($tempLocal);
+        
+        // Find first location block and insert before it
+        $pattern = '/(location\s+\/\s+{)/';
+        $replacement = "$markerStart\n$varnishLocation\n$markerEnd\n$1";
+        $content = preg_replace($pattern, $replacement, $content, 1);
+        
+        // Write back
+        file_put_contents($tempLocal, $content);
+        $ssh->upload($tempLocal, "/tmp/nginx-$domain.conf");
+        $ssh->exec("sudo mv /tmp/nginx-$domain.conf $configPath");
+        $ssh->exec("sudo chmod 644 $configPath");
+        
+        unlink($tempLocal);
     }
 
     /**
-     * Configure Varnish service
+     * Configure Varnish service to run on port 6081
      *
      * @param string $memory
      * @return void
@@ -376,9 +430,9 @@ VCL;
     {
         $ssh = $this->site->server->ssh();
 
-        // Configure Varnish to listen on ports 80 and 443
+        // Configure Varnish to listen on port 6081 (not 80/443)
         $varnishConfig = <<<CONFIG
-VARNISH_LISTEN_PORT=80
+VARNISH_LISTEN_PORT=6081
 VARNISH_ADMIN_LISTEN_ADDRESS=127.0.0.1
 VARNISH_ADMIN_LISTEN_PORT=6082
 VARNISH_SECRET_FILE=/etc/varnish/secret
@@ -394,7 +448,7 @@ CONFIG;
         $ssh->exec('sudo chmod 644 /etc/varnish/varnish.params');
         unlink($tempFile);
 
-        // Update systemd service file
+        // Update systemd service file - Varnish listens on 6081
         $serviceConfig = <<<SERVICE
 [Unit]
 Description=Varnish Cache
@@ -402,7 +456,7 @@ After=network.target
 
 [Service]
 Type=forking
-ExecStart=/usr/sbin/varnishd -a :80 -a :443,PROXY -T 127.0.0.1:6082 -f /etc/varnish/default.vcl -s malloc,$memory
+ExecStart=/usr/sbin/varnishd -a :6081 -T 127.0.0.1:6082 -f /etc/varnish/default.vcl -s malloc,$memory
 ExecReload=/usr/sbin/varnishreload
 PIDFile=/run/varnish.pid
 

@@ -195,8 +195,8 @@ class PurgeCache extends Action
             $url = '/' . $url;
         }
 
-        // Send PURGE request via curl
-        $command = "curl -X PURGE -H 'Host: {$domain}' http://localhost{$url}";
+        // Send PURGE request via curl to Varnish on port 6081
+        $command = "curl -X PURGE -H 'Host: {$domain}' http://localhost:6081{$url}";
         
         try {
             $ssh->exec($command, 'purge-single-url-varnish-cache');
@@ -219,8 +219,8 @@ class PurgeCache extends Action
      */
     private function purgeViaHttp($ssh, string $domain, string $pattern): void
     {
-        // Send PURGE request with X-Purge-Regex header
-        $command = "curl -X PURGE -H 'Host: {$domain}' -H 'X-Purge-Regex: {$pattern}' http://localhost/";
+        // Send PURGE request to Varnish on port 6081
+        $command = "curl -X PURGE -H 'Host: {$domain}' -H 'X-Purge-Regex: {$pattern}' http://localhost:6081/";
         $ssh->exec($command, 'purge-varnish-via-http');
     }
 }
