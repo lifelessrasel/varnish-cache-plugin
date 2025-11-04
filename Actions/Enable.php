@@ -339,15 +339,17 @@ sub vcl_deliver {
 
 VCL;
 
-        // Write VCL to server
-        // Write VCL to server using heredoc and echo instead of file upload
+        // Write VCL to server using cat with heredoc
+        $vclPath = "/etc/varnish/sites/{$domain}.vcl";
         $ssh->exec("sudo mkdir -p /etc/varnish/sites");
         
-        // Escape the VCL content for safe shell transmission
-        $vclEscaped = addcslashes($vcl, '"$`\\');
+        // Escape single quotes and backslashes in VCL content
+        $vclEscaped = str_replace("'", "'\\''", $vcl);
         
-        // Write VCL file using echo
-        $ssh->exec("echo \"$vclEscaped\" | sudo tee $vclPath > /dev/null");
+        // Write VCL file using cat with heredoc (single quotes prevent variable expansion)
+        $ssh->exec("sudo bash -c 'cat > $vclPath <<'\"'\"'VCLEOF'\"'\"'
+$vclEscaped
+VCLEOF'");
         $ssh->exec("sudo chmod 644 $vclPath");
 
         // Update main Varnish config to include this site
@@ -393,7 +395,9 @@ VCL;
         
         // Create Varnish proxy configuration
         // This proxies all requests to Varnish on port 6081
-        $varnishConfig = "# Varnish Cache Proxy Configuration
+        // Use cat with heredoc for reliable writing
+        $ssh->exec("sudo bash -c 'cat > $varnishConfigPath <<\"EOF\"
+# Varnish Cache Proxy Configuration
 # All requests are proxied to Varnish on port 6081
 
 proxy_pass http://127.0.0.1:6081;
@@ -410,11 +414,8 @@ proxy_buffer_size 4k;
 proxy_buffers 24 4k;
 proxy_busy_buffers_size 8k;
 proxy_max_temp_file_size 2048m;
-proxy_temp_file_write_size 32k;";
-
-        // Write Varnish proxy config using echo
-        $varnishConfigEscaped = addcslashes($varnishConfig, '"$`\\');
-        $ssh->exec("echo \"$varnishConfigEscaped\" | sudo tee $varnishConfigPath > /dev/null");
+proxy_temp_file_write_size 32k;
+EOF'");
         $ssh->exec("sudo chmod 644 $varnishConfigPath");
 
         // Now update the main Nginx config to include this file in location /
@@ -489,7 +490,7 @@ proxy_temp_file_write_size 32k;";
 
     /**
      * Configure Varnish service to run on port 6081
-     * Uses echo instead of file upload for better reliability
+     * Uses cat with heredoc for reliable multi-line file writing
      *
      * @param string $memory
      * @return void
@@ -500,19 +501,21 @@ proxy_temp_file_write_size 32k;";
         $ssh = $this->site->server->ssh();
 
         // Configure Varnish to listen on port 6081 (not 80/443)
-        $varnishConfig = "VARNISH_LISTEN_PORT=6081
+        // Use cat with heredoc for reliable writing
+        $ssh->exec("sudo bash -c 'cat > /etc/varnish/varnish.params <<\"EOF\"
+VARNISH_LISTEN_PORT=6081
 VARNISH_ADMIN_LISTEN_ADDRESS=127.0.0.1
 VARNISH_ADMIN_LISTEN_PORT=6082
 VARNISH_SECRET_FILE=/etc/varnish/secret
 VARNISH_STORAGE=\"malloc,$memory\"
-VARNISH_TTL=300";
-
-        // Write config using echo
-        $ssh->exec("echo '$varnishConfig' | sudo tee /etc/varnish/varnish.params > /dev/null");
+VARNISH_TTL=300
+EOF'");
         $ssh->exec('sudo chmod 644 /etc/varnish/varnish.params');
 
         // Update systemd service file - Varnish listens on 6081
-        $serviceConfig = "[Unit]
+        // Use cat with heredoc for reliable writing
+        $ssh->exec("sudo bash -c 'cat > /etc/systemd/system/varnish.service <<\"EOF\"
+[Unit]
 Description=Varnish Cache
 After=network.target
 
@@ -523,10 +526,8 @@ ExecReload=/usr/sbin/varnishreload
 PIDFile=/run/varnish.pid
 
 [Install]
-WantedBy=multi-user.target";
-
-        // Write service file using echo
-        $ssh->exec("echo '$serviceConfig' | sudo tee /etc/systemd/system/varnish.service > /dev/null");
+WantedBy=multi-user.target
+EOF'");
         $ssh->exec('sudo chmod 644 /etc/systemd/system/varnish.service');
 
         // Reload systemd
