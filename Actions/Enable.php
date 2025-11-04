@@ -90,17 +90,33 @@ class Enable extends Action
         $cacheTtl = $request->input('cache_ttl', 300);
         $memory = $request->input('memory', '256M');
 
-        // Check if Varnish is installed, install if not
-        $this->installVarnish();
+        try {
+            // Check if Varnish is installed, install if not
+            $this->installVarnish();
+        } catch (\Exception $e) {
+            throw new \Exception('Failed to install Varnish: ' . $e->getMessage());
+        }
 
-        // Configure Varnish service to run on port 6081
-        $this->configureVarnishService($memory);
+        try {
+            // Configure Varnish service to run on port 6081
+            $this->configureVarnishService($memory);
+        } catch (\Exception $e) {
+            throw new \Exception('Failed to configure Varnish service: ' . $e->getMessage());
+        }
 
-        // Create Varnish VCL configuration
-        $this->createVarnishConfig($cacheTtl);
+        try {
+            // Create Varnish VCL configuration
+            $this->createVarnishConfig($cacheTtl);
+        } catch (\Exception $e) {
+            throw new \Exception('Failed to create Varnish VCL config: ' . $e->getMessage());
+        }
 
-        // Update Nginx to proxy through Varnish
-        $this->updateNginxForVarnish();
+        try {
+            // Update Nginx to proxy through Varnish
+            $this->updateNginxForVarnish();
+        } catch (\Exception $e) {
+            throw new \Exception('Failed to update Nginx configuration: ' . $e->getMessage());
+        }
 
         // Update site metadata
         $typeData = $this->site->type_data ?? [];
@@ -110,9 +126,13 @@ class Enable extends Action
         $this->site->type_data = $typeData;
         $this->site->save();
 
-        // Restart services
-        $this->site->server->ssh()->exec('sudo systemctl restart varnish');
-        $this->site->server->ssh()->exec('sudo systemctl reload nginx');
+        try {
+            // Restart services
+            $this->site->server->ssh()->exec('sudo systemctl restart varnish');
+            $this->site->server->ssh()->exec('sudo systemctl reload nginx');
+        } catch (\Exception $e) {
+            throw new \Exception('Varnish configured but failed to restart services: ' . $e->getMessage() . '. Please restart manually.');
+        }
 
         $request->session()->flash('success', 'Varnish cache has been enabled for this site.');
     }
@@ -129,28 +149,34 @@ class Enable extends Action
 
         // Check if Varnish is already installed
         try {
-            $installed = $ssh->exec('which varnishd');
-            if (!empty($installed)) {
+            $result = $ssh->exec('varnishd -V 2>&1 | head -n1');
+            if (!empty($result) && strpos($result, 'varnish') !== false) {
                 return; // Already installed
             }
         } catch (\Exception $e) {
             // Not installed, proceed with installation
         }
 
-        // Install Varnish
-        // Use --allow-releaseinfo-change to handle repository updates
-        // Use || true to continue even if update has warnings
-        $ssh->exec('sudo apt-get update --allow-releaseinfo-change -y 2>&1 || true', 'update-packages');
-        
-        // Install Varnish - if it fails, try to install from official Varnish repos
         try {
-            $ssh->exec('sudo apt-get install -y varnish 2>&1', 'install-varnish');
+            // Try simple installation first
+            $ssh->exec('sudo DEBIAN_FRONTEND=noninteractive apt-get install -y varnish 2>&1');
+            $ssh->exec('sudo systemctl enable varnish 2>&1');
+            return;
         } catch (\Exception $e) {
-            // If default repos fail, install from Varnish official repos
+            // If that fails, update repos and try again
+        }
+
+        try {
+            // Update package lists (ignore errors from bad repos)
+            $ssh->exec('sudo apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true 2>&1 || true');
+            
+            // Try installing again
+            $ssh->exec('sudo DEBIAN_FRONTEND=noninteractive apt-get install -y varnish 2>&1');
+            $ssh->exec('sudo systemctl enable varnish 2>&1');
+        } catch (\Exception $e) {
+            // Last resort: install from Varnish official repos
             $this->installVarnishFromOfficialRepo($ssh);
         }
-        
-        $ssh->exec('sudo systemctl enable varnish', 'enable-varnish');
     }
     
     /**
@@ -416,15 +442,36 @@ NGINX;
     {
         $configPath = "/etc/nginx/sites-available/$domain";
         
+        // Check if config file exists
+        try {
+            $ssh->exec("test -f $configPath");
+        } catch (\Exception $e) {
+            throw new \Exception("Nginx configuration file not found at $configPath");
+        }
+        
         // Backup original config
-        $ssh->exec("sudo cp $configPath {$configPath}.varnish-backup");
+        try {
+            $ssh->exec("sudo cp $configPath {$configPath}.varnish-backup");
+        } catch (\Exception $e) {
+            throw new \Exception("Failed to backup Nginx configuration");
+        }
         
         // Download config
         $tempLocal = tempnam(sys_get_temp_dir(), 'nginx');
-        $ssh->download($configPath, $tempLocal);
+        
+        try {
+            $ssh->download($configPath, $tempLocal);
+        } catch (\Exception $e) {
+            throw new \Exception("Failed to download Nginx configuration file");
+        }
         
         // Read config
         $content = file_get_contents($tempLocal);
+        
+        if (empty($content)) {
+            unlink($tempLocal);
+            throw new \Exception("Nginx configuration file is empty");
+        }
         
         // Add include directive in the location / block
         // Find the location / block and add include after the opening brace
@@ -434,13 +481,37 @@ NGINX;
         
         // Check if already included
         if (strpos($content, '# VARNISH_INCLUDE_START') === false) {
-            $content = preg_replace($pattern, $replacement, $content, 1);
+            $modified = preg_replace($pattern, $replacement, $content, 1);
+            
+            if ($modified === null || $modified === $content) {
+                unlink($tempLocal);
+                throw new \Exception("Could not find 'location /' block in Nginx config. Please check your site configuration.");
+            }
             
             // Write back
-            file_put_contents($tempLocal, $content);
-            $ssh->upload($tempLocal, "/tmp/nginx-$domain.conf");
-            $ssh->exec("sudo mv /tmp/nginx-$domain.conf $configPath");
-            $ssh->exec("sudo chmod 644 $configPath");
+            file_put_contents($tempLocal, $modified);
+            
+            try {
+                $ssh->upload($tempLocal, "/tmp/nginx-$domain.conf");
+                $ssh->exec("sudo mv /tmp/nginx-$domain.conf $configPath");
+                $ssh->exec("sudo chmod 644 $configPath");
+                
+                // Test nginx configuration
+                $testResult = $ssh->exec("sudo nginx -t 2>&1");
+                if (strpos($testResult, 'failed') !== false || strpos($testResult, 'error') !== false) {
+                    // Restore backup if test fails
+                    $ssh->exec("sudo cp {$configPath}.varnish-backup $configPath");
+                    throw new \Exception("Nginx configuration test failed: $testResult");
+                }
+            } catch (\Exception $e) {
+                // Restore backup on any error
+                try {
+                    $ssh->exec("sudo cp {$configPath}.varnish-backup $configPath");
+                } catch (\Exception $restoreError) {
+                    // Ignore restore errors
+                }
+                throw $e;
+            }
         }
         
         unlink($tempLocal);
