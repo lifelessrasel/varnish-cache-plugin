@@ -217,6 +217,7 @@ class Enable extends Action
      */
     private function createVarnishConfig(int $cacheTtl): void
     {
+        $ssh = $this->site->server->ssh();
         $domain = $this->site->domain;
         $aliases = $this->site->aliases ?? [];
         
