@@ -340,19 +340,15 @@ sub vcl_deliver {
 VCL;
 
         // Write VCL to server
-        $vclPath = "/etc/varnish/sites/{$domain}.vcl";
-        $ssh = $this->site->server->ssh();
-        
-        // Create sites directory if it doesn't exist
+        // Write VCL to server using heredoc and echo instead of file upload
         $ssh->exec("sudo mkdir -p /etc/varnish/sites");
         
-        // Write VCL file
-        $tempFile = tempnam(sys_get_temp_dir(), 'vcl');
-        file_put_contents($tempFile, $vcl);
-        $ssh->upload($tempFile, "/tmp/{$domain}.vcl");
-        $ssh->exec("sudo mv /tmp/{$domain}.vcl $vclPath");
+        // Escape the VCL content for safe shell transmission
+        $vclEscaped = addcslashes($vcl, '"$`\\');
+        
+        // Write VCL file using echo
+        $ssh->exec("echo \"$vclEscaped\" | sudo tee $vclPath > /dev/null");
         $ssh->exec("sudo chmod 644 $vclPath");
-        unlink($tempFile);
 
         // Update main Varnish config to include this site
         $this->updateMainVarnishConfig($vclPath);
@@ -381,6 +377,7 @@ VCL;
     /**
      * Update Nginx configuration to proxy through Varnish
      * This creates a separate config file that Nginx includes
+     * Uses echo instead of file upload for better reliability
      *
      * @return void
      * @throws SSHError
@@ -396,16 +393,15 @@ VCL;
         
         // Create Varnish proxy configuration
         // This proxies all requests to Varnish on port 6081
-        $varnishConfig = <<<'NGINX'
-# Varnish Cache Proxy Configuration
+        $varnishConfig = "# Varnish Cache Proxy Configuration
 # All requests are proxied to Varnish on port 6081
 
 proxy_pass http://127.0.0.1:6081;
-proxy_set_header Host $host;
-proxy_set_header X-Real-IP $remote_addr;
-proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-proxy_set_header X-Forwarded-Proto $scheme;
-proxy_set_header X-Forwarded-Port $server_port;
+proxy_set_header Host \$host;
+proxy_set_header X-Real-IP \$remote_addr;
+proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto \$scheme;
+proxy_set_header X-Forwarded-Port \$server_port;
 proxy_redirect off;
 
 # Buffer settings
@@ -414,16 +410,12 @@ proxy_buffer_size 4k;
 proxy_buffers 24 4k;
 proxy_busy_buffers_size 8k;
 proxy_max_temp_file_size 2048m;
-proxy_temp_file_write_size 32k;
-NGINX;
+proxy_temp_file_write_size 32k;";
 
-        // Write Varnish proxy config
-        $tempFile = tempnam(sys_get_temp_dir(), 'varnish-nginx');
-        file_put_contents($tempFile, $varnishConfig);
-        $ssh->upload($tempFile, "/tmp/varnish-{$domain}.conf");
-        $ssh->exec("sudo mv /tmp/varnish-{$domain}.conf $varnishConfigPath");
+        // Write Varnish proxy config using echo
+        $varnishConfigEscaped = addcslashes($varnishConfig, '"$`\\');
+        $ssh->exec("echo \"$varnishConfigEscaped\" | sudo tee $varnishConfigPath > /dev/null");
         $ssh->exec("sudo chmod 644 $varnishConfigPath");
-        unlink($tempFile);
 
         // Now update the main Nginx config to include this file in location /
         $this->includeVarnishInNginx($ssh, $domain, $varnishConfigPath);
@@ -431,6 +423,7 @@ NGINX;
     
     /**
      * Include Varnish configuration in the main Nginx site config
+     * Uses SSH commands instead of file download/upload for better reliability
      *
      * @param $ssh
      * @param string $domain
@@ -449,6 +442,16 @@ NGINX;
             throw new \Exception("Nginx configuration file not found at $configPath");
         }
         
+        // Check if already included
+        try {
+            $checkInclude = $ssh->exec("grep -q '# VARNISH_INCLUDE_START' $configPath && echo 'exists' || echo 'not-exists'");
+            if (trim($checkInclude) === 'exists') {
+                return; // Already configured
+            }
+        } catch (\Exception $e) {
+            // Continue with installation
+        }
+        
         // Backup original config
         try {
             $ssh->exec("sudo cp $configPath {$configPath}.varnish-backup");
@@ -456,69 +459,37 @@ NGINX;
             throw new \Exception("Failed to backup Nginx configuration");
         }
         
-        // Download config
-        $tempLocal = tempnam(sys_get_temp_dir(), 'nginx');
+        // Use sed to insert the include directive after "location / {"
+        // This is more reliable than downloading/uploading files
+        $includeBlock = "# VARNISH_INCLUDE_START\\n        include $varnishConfigPath;\\n        # VARNISH_INCLUDE_END";
         
         try {
-            $ssh->download($configPath, $tempLocal);
+            // Use sed to insert after the first "location / {" line
+            $sedCommand = "sudo sed -i '0,/location[[:space:]]\+\/[[:space:]]*{/s|location[[:space:]]\+\/[[:space:]]*{|&\\n        $includeBlock|' $configPath";
+            $ssh->exec($sedCommand);
+            
+            // Test nginx configuration
+            $testResult = $ssh->exec("sudo nginx -t 2>&1");
+            if (strpos($testResult, 'test failed') !== false || strpos(strtolower($testResult), 'emerg') !== false) {
+                // Restore backup if test fails
+                $ssh->exec("sudo cp {$configPath}.varnish-backup $configPath");
+                throw new \Exception("Nginx configuration test failed: $testResult");
+            }
+            
         } catch (\Exception $e) {
-            throw new \Exception("Failed to download Nginx configuration file");
-        }
-        
-        // Read config
-        $content = file_get_contents($tempLocal);
-        
-        if (empty($content)) {
-            unlink($tempLocal);
-            throw new \Exception("Nginx configuration file is empty");
-        }
-        
-        // Add include directive in the location / block
-        // Find the location / block and add include after the opening brace
-        $pattern = '/(location\s+\/\s+\{)/';
-        $includeDirective = "include $varnishConfigPath;";
-        $replacement = "$1\n        # VARNISH_INCLUDE_START\n        $includeDirective\n        # VARNISH_INCLUDE_END\n";
-        
-        // Check if already included
-        if (strpos($content, '# VARNISH_INCLUDE_START') === false) {
-            $modified = preg_replace($pattern, $replacement, $content, 1);
-            
-            if ($modified === null || $modified === $content) {
-                unlink($tempLocal);
-                throw new \Exception("Could not find 'location /' block in Nginx config. Please check your site configuration.");
-            }
-            
-            // Write back
-            file_put_contents($tempLocal, $modified);
-            
+            // Restore backup on any error
             try {
-                $ssh->upload($tempLocal, "/tmp/nginx-$domain.conf");
-                $ssh->exec("sudo mv /tmp/nginx-$domain.conf $configPath");
-                $ssh->exec("sudo chmod 644 $configPath");
-                
-                // Test nginx configuration
-                $testResult = $ssh->exec("sudo nginx -t 2>&1");
-                if (strpos($testResult, 'failed') !== false || strpos($testResult, 'error') !== false) {
-                    // Restore backup if test fails
-                    $ssh->exec("sudo cp {$configPath}.varnish-backup $configPath");
-                    throw new \Exception("Nginx configuration test failed: $testResult");
-                }
-            } catch (\Exception $e) {
-                // Restore backup on any error
-                try {
-                    $ssh->exec("sudo cp {$configPath}.varnish-backup $configPath");
-                } catch (\Exception $restoreError) {
-                    // Ignore restore errors
-                }
-                throw $e;
+                $ssh->exec("sudo cp {$configPath}.varnish-backup $configPath 2>&1 || true");
+            } catch (\Exception $restoreError) {
+                // Ignore restore errors
             }
+            throw new \Exception("Failed to update Nginx config: " . $e->getMessage());
         }
-        
-        unlink($tempLocal);
     }
 
     /**
      * Configure Varnish service to run on port 6081
+     * Uses echo instead of file upload for better reliability
      *
      * @param string $memory
      * @return void
@@ -529,26 +500,19 @@ NGINX;
         $ssh = $this->site->server->ssh();
 
         // Configure Varnish to listen on port 6081 (not 80/443)
-        $varnishConfig = <<<CONFIG
-VARNISH_LISTEN_PORT=6081
+        $varnishConfig = "VARNISH_LISTEN_PORT=6081
 VARNISH_ADMIN_LISTEN_ADDRESS=127.0.0.1
 VARNISH_ADMIN_LISTEN_PORT=6082
 VARNISH_SECRET_FILE=/etc/varnish/secret
-VARNISH_STORAGE="malloc,$memory"
-VARNISH_TTL=300
-CONFIG;
+VARNISH_STORAGE=\"malloc,$memory\"
+VARNISH_TTL=300";
 
-        // Write config
-        $tempFile = tempnam(sys_get_temp_dir(), 'varnish');
-        file_put_contents($tempFile, $varnishConfig);
-        $ssh->upload($tempFile, '/tmp/varnish.conf');
-        $ssh->exec('sudo mv /tmp/varnish.conf /etc/varnish/varnish.params');
+        // Write config using echo
+        $ssh->exec("echo '$varnishConfig' | sudo tee /etc/varnish/varnish.params > /dev/null");
         $ssh->exec('sudo chmod 644 /etc/varnish/varnish.params');
-        unlink($tempFile);
 
         // Update systemd service file - Varnish listens on 6081
-        $serviceConfig = <<<SERVICE
-[Unit]
+        $serviceConfig = "[Unit]
 Description=Varnish Cache
 After=network.target
 
@@ -559,15 +523,11 @@ ExecReload=/usr/sbin/varnishreload
 PIDFile=/run/varnish.pid
 
 [Install]
-WantedBy=multi-user.target
-SERVICE;
+WantedBy=multi-user.target";
 
-        $tempFile = tempnam(sys_get_temp_dir(), 'service');
-        file_put_contents($tempFile, $serviceConfig);
-        $ssh->upload($tempFile, '/tmp/varnish.service');
-        $ssh->exec('sudo mv /tmp/varnish.service /etc/systemd/system/varnish.service');
+        // Write service file using echo
+        $ssh->exec("echo '$serviceConfig' | sudo tee /etc/systemd/system/varnish.service > /dev/null");
         $ssh->exec('sudo chmod 644 /etc/systemd/system/varnish.service');
-        unlink($tempFile);
 
         // Reload systemd
         $ssh->exec('sudo systemctl daemon-reload');
