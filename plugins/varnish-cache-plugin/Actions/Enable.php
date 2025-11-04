@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Vito\Plugins\Vitodeploy\VarnishCachePlugin\Actions;
+namespace App\Vito\Plugins\Lifelessrasel\VarnishCachePlugin\Actions;
 
 use App\Actions\Worker\CreateWorker;
 use App\Actions\Worker\ManageWorker;

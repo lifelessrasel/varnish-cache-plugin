@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Vito\Plugins\Vitodeploy\VarnishCachePlugin;
+namespace App\Vito\Plugins\Lifelessrasel\VarnishCachePlugin;
 
 use App\Plugins\AbstractPlugin;
 use App\Plugins\RegisterSiteFeature;
